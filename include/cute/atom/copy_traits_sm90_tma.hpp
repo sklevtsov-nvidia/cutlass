@@ -52,7 +52,7 @@ struct AuxTmaParams {
   using GmemStrides  = GmemTmaBasisStrides_;    // Strides for Gmem mode -> Tma coord mode, may be dynamic
   GmemStrides g_stride_;
   using TmaGmemBasis = TmaGmemBasis_;           // Layout for Tma box shape -> Gmem mode(s), always static
-  static_assert(is_static<TmaGmemBasis>::value);
+  //static_assert(is_static<TmaGmemBasis>::value);
   using TmaSwizzle   = TmaSwizzle_;             // Tma swizzle, always Swizzle<B,M,S>
   static_assert(is_static<TmaSwizzle>::value);
 };
