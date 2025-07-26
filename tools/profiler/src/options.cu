@@ -593,6 +593,9 @@ Options::Verification::Verification(cutlass::CommandLine const &cmdline) {
   if (enabled) {
     cmdline.get_cmd_line_argument("verification-required", required, false);
   }
+  else {
+    required = false;
+  }
 
   cmdline.get_cmd_line_argument("epsilon", epsilon, 0.05);
 
