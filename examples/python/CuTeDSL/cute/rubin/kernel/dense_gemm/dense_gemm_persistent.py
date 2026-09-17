@@ -1590,6 +1590,7 @@ def run(
         iterations=iterations,
     )
     print(f"[DSL INFO] Execution time: {exec_time} microseconds per iteration")
+    print(f"[DSL INFO] Throughput: {mnkl[0]*mnkl[1]*mnkl[2]*mnkl[3]*2/exec_time/1000/1000} TFLOP/s")
     return exec_time
 
 
