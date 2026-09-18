@@ -27,9 +27,10 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import argparse
+import dataclasses
 import os
 import sys
-from typing import Tuple, Type, Union, Literal, Optional, NamedTuple
+from typing import Any, Callable, Tuple, Type, Union, Literal, Optional, NamedTuple
 
 import cuda.bindings.driver as cuda
 import torch
@@ -48,10 +49,9 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.rubin_helpers as sm107_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 
-if __name__ == "__main__":
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    sys.path.insert(0, os.path.join(current_dir, "../../../.."))
-    sys.path.insert(0, os.path.join(current_dir, "../../.."))
+current_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(current_dir, "../../../.."))
+sys.path.insert(0, os.path.join(current_dir, "../../.."))
 
 from blackwell.kernel.blockscaled_gemm.dense_blockscaled_gemm_persistent import (
     Sm100BlockScaledPersistentDenseGemmKernel,
@@ -2514,6 +2514,23 @@ def construct_abc_cute_pointers_emulated(
     return a_ptr, b_ptr, c_ptr, a_cute, b_cute
 
 
+@dataclasses.dataclass
+class BenchmarkContext:
+    """Everything needed to (re-)run the compiled kernel via ``cutlass.testing.benchmark``.
+
+    Passed to an optional ``benchmark_sweep`` callback so external drivers (e.g. a GPU
+    clock sweep) can invoke ``cutlass.testing.benchmark`` themselves, multiple times,
+    without recompiling the kernel.
+    """
+
+    compiled_fn: Any
+    generate_tensors: Callable[[], Any]
+    current_stream: cuda.CUstream
+    mnkl: Tuple[int, int, int, int]
+    use_cold_l2: bool
+    one_workspace_bytes: Optional[int]
+
+
 def run_scaled_mm_with_emulated_dtype(
     gemm_obj: Sm107BlockScaledPersistentDenseGemmKernel,
     mnkl: Tuple[int, int, int, int],
@@ -2536,6 +2553,7 @@ def run_scaled_mm_with_emulated_dtype(
     normal_mean: float = 0.0,
     normal_std: float = 1.0,
     prefetch_dist: Union[int, None] = None,
+    benchmark_sweep: Optional[Callable[["BenchmarkContext"], Any]] = None,
     **kwargs,
 ):
     """Execute a persistent batched dense blockscaled GEMM operation on Rubin architecture with performance benchmarking (emulated dtypes).
@@ -2728,7 +2746,7 @@ def run_scaled_mm_with_emulated_dtype(
         )
         return jit_args
 
-    workspace_count = 1
+    one_workspace_bytes = None
     if use_cold_l2:
         one_workspace_bytes = (
             a_f32_ref.numel() * a_f32_ref.element_size()
@@ -2737,6 +2755,21 @@ def run_scaled_mm_with_emulated_dtype(
             + sfb_torch.numel() * sfb_torch.element_size()
             + c.numel() * c.element_size()
         )
+
+    if benchmark_sweep is not None:
+        return benchmark_sweep(
+            BenchmarkContext(
+                compiled_fn=compiled_gemm,
+                generate_tensors=generate_inputs,
+                current_stream=current_stream,
+                mnkl=mnkl,
+                use_cold_l2=use_cold_l2,
+                one_workspace_bytes=one_workspace_bytes,
+            )
+        )
+
+    workspace_count = 1
+    if use_cold_l2:
         workspace_count = cutlass.testing.get_workspace_count(
             one_workspace_bytes, warmup_iterations, iterations
         )
@@ -2778,6 +2811,7 @@ def run(
     normal_mean: float = 0.0,
     normal_std: float = 1.0,
     prefetch_dist: Union[int, None] = None,
+    benchmark_sweep: Optional[Callable[["BenchmarkContext"], Any]] = None,
     **kwargs,
 ):
     """
@@ -2828,7 +2862,7 @@ def run(
         scheduler_type,
     )
 
-    exec_time = run_scaled_mm_with_emulated_dtype(
+    result = run_scaled_mm_with_emulated_dtype(
         gemm,
         mnkl,
         a_dtype,
@@ -2850,9 +2884,15 @@ def run(
         normal_mean,
         normal_std,
         prefetch_dist,
+        benchmark_sweep=benchmark_sweep,
     )
 
+    if benchmark_sweep is not None:
+        return result
+
+    exec_time = result
     print(f"[DSL INFO] Execution time: {exec_time} microseconds per iteration")
+    print(f"[DSL INFO] Throughput: {mnkl[0]*mnkl[1]*mnkl[2]*mnkl[3]*2/exec_time/1000/1000} TFLOP/s")
     return exec_time
 
 

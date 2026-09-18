@@ -29,7 +29,8 @@
 import os
 import sys
 import argparse
-from typing import Optional, Tuple, Type, Union, Literal
+import dataclasses
+from typing import Any, Callable, Optional, Tuple, Type, Union, Literal
 from functools import lru_cache
 
 import cuda.bindings.driver as cuda
@@ -45,10 +46,9 @@ from cutlass.cute.nvgpu.tcgen05 import CollectorOp
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 
-if __name__ == "__main__":
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    sys.path.insert(0, os.path.join(current_dir, "../../../.."))
-    sys.path.insert(0, os.path.join(current_dir, "../../.."))
+current_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(current_dir, "../../../.."))
+sys.path.insert(0, os.path.join(current_dir, "../../.."))
 
 from blackwell.kernel.dense_gemm.dense_gemm_persistent import (
     PersistentDenseGemmKernel as BlackwellPersistentDenseGemmKernel,
@@ -1343,6 +1343,23 @@ def compile_bmm(
     return cute.compile(bmm, gemm, a, b, c, max_active_clusters, stream, epilogue_op)
 
 
+@dataclasses.dataclass
+class BenchmarkContext:
+    """Everything needed to (re-)run the compiled kernel via ``cutlass.testing.benchmark``.
+
+    Passed to an optional ``benchmark_sweep`` callback so external drivers (e.g. a GPU
+    clock sweep) can invoke ``cutlass.testing.benchmark`` themselves, multiple times,
+    without recompiling the kernel.
+    """
+
+    compiled_fn: Any
+    generate_tensors: Callable[[], Any]
+    current_stream: cuda.CUstream
+    mnkl: Tuple[int, int, int, int]
+    use_cold_l2: bool
+    one_workspace_bytes: Optional[int]
+
+
 def run(
     mnkl: Tuple[int, int, int, int],
     a_dtype: Type[cutlass.Numeric],
@@ -1368,6 +1385,7 @@ def run(
     init_normal: bool = False,
     normal_mean: float = 0.0,
     normal_std: float = 1.0,
+    benchmark_sweep: Optional[Callable[["BenchmarkContext"], Any]] = None,
     **kwargs,
 ):
     """
@@ -1569,13 +1587,28 @@ def run(
         )
         return testing.JitArguments(a_, b_, c_, current_stream)
 
-    workspace_count = 1
+    one_workspace_bytes = None
     if use_cold_l2:
         one_workspace_bytes = (
             a_storage.numel() * a_storage.element_size()
             + b_storage.numel() * b_storage.element_size()
             + c_storage.numel() * c_storage.element_size()
         )
+
+    if benchmark_sweep is not None:
+        return benchmark_sweep(
+            BenchmarkContext(
+                compiled_fn=compiled_fn,
+                generate_tensors=generate_tensors,
+                current_stream=current_stream,
+                mnkl=mnkl,
+                use_cold_l2=use_cold_l2,
+                one_workspace_bytes=one_workspace_bytes,
+            )
+        )
+
+    workspace_count = 1
+    if use_cold_l2:
         workspace_count = testing.get_workspace_count(
             one_workspace_bytes, warmup_iterations, iterations
         )
@@ -1603,7 +1636,7 @@ def _parse_comma_separated_ints(s: str) -> Tuple[int, ...]:
         )
 
 
-if __name__ == "__main__":
+def prepare_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Example of Dense Persistent GEMM on Rubin."
     )
@@ -1728,6 +1761,11 @@ if __name__ == "__main__":
         help="Rasterization order of clusters",
     )
 
+    return parser
+
+
+if __name__ == "__main__":
+    parser = prepare_parser()
     args = parser.parse_args()
 
     if len(args.mnkl) != 4:
