@@ -11,10 +11,10 @@ def lock_sm_clock(clock_mhz: int, gpu_index: int = 0):
         [
             "sudo",
             "nvidia-smi",
-            "-i",
-            str(gpu_index),
             "-lgc",
             f"{clock_mhz},{clock_mhz}",
+            "-i",
+            str(gpu_index),
         ],
         check=True,
         capture_output=True,
@@ -24,7 +24,13 @@ def lock_sm_clock(clock_mhz: int, gpu_index: int = 0):
 
 def reset_sm_clock(gpu_index: int = 0):
     subprocess.run(
-        ["sudo", "nvidia-smi", "-i", str(gpu_index), "-rgc"],
+        [
+            "sudo",
+            "nvidia-smi",
+            "-rgc",
+            "-i",
+            str(gpu_index),
+        ],
         check=True,
         capture_output=True,
         text=True,
