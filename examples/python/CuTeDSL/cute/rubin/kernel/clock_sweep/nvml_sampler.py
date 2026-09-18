@@ -41,6 +41,43 @@ class SweepStats:
     samples: List[SweepSample]
 
 
+def compute_stats(samples: List[SweepSample]) -> SweepStats:
+    if not samples:
+        return SweepStats(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, [])
+    sm_clocks = [s.sm_clock_mhz for s in samples]
+    powers = [s.power_w for s in samples]
+    temps = [s.temperature_c for s in samples if s.temperature_c >= 0]
+    return SweepStats(
+        num_samples=len(samples),
+        duration_s=samples[-1].t - samples[0].t,
+        mean_sm_clock_mhz=sum(sm_clocks) / len(sm_clocks),
+        min_sm_clock_mhz=min(sm_clocks),
+        max_sm_clock_mhz=max(sm_clocks),
+        mean_power_w=sum(powers) / len(powers),
+        max_power_w=max(powers),
+        mean_temperature_c=(sum(temps) / len(temps)) if temps else -1.0,
+        samples=samples,
+    )
+
+
+def trim_by_time_fraction(
+    samples: List[SweepSample], keep_fraction: float
+) -> List[SweepSample]:
+    """Discard the earliest ``1 - keep_fraction`` of ``samples`` by elapsed time.
+
+    Useful for dropping a leading region (e.g. clock ramp-up right after locking a
+    new clock, or a long warmup phase) that shouldn't count towards steady-state
+    clock/power stats. Always keeps at least the last sample.
+    """
+    if not samples or keep_fraction >= 1.0:
+        return samples
+    keep_fraction = max(keep_fraction, 0.0)
+    t0, t1 = samples[0].t, samples[-1].t
+    cutoff = t1 - keep_fraction * (t1 - t0)
+    trimmed = [s for s in samples if s.t >= cutoff]
+    return trimmed or samples[-1:]
+
+
 class NvmlSampler:
     """Samples SM clock and power draw for one GPU at a fixed interval on a background thread."""
 
@@ -102,20 +139,4 @@ class NvmlSampler:
         if self._thread is not None:
             self._thread.join()
             self._thread = None
-        samples = self._samples
-        if not samples:
-            return SweepStats(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, [])
-        sm_clocks = [s.sm_clock_mhz for s in samples]
-        powers = [s.power_w for s in samples]
-        temps = [s.temperature_c for s in samples if s.temperature_c >= 0]
-        return SweepStats(
-            num_samples=len(samples),
-            duration_s=samples[-1].t - samples[0].t,
-            mean_sm_clock_mhz=sum(sm_clocks) / len(sm_clocks),
-            min_sm_clock_mhz=min(sm_clocks),
-            max_sm_clock_mhz=max(sm_clocks),
-            mean_power_w=sum(powers) / len(powers),
-            max_power_w=max(powers),
-            mean_temperature_c=(sum(temps) / len(temps)) if temps else -1.0,
-            samples=samples,
-        )
+        return compute_stats(self._samples)

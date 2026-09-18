@@ -15,7 +15,8 @@ locking, NVML sampling, table/CSV output) is generic: any kernel module that exp
 
 Example:
     python sweep_clocks.py \\
-        --clock-min 1200 --clock-max 1900 --clock-step 50 --target-seconds 15 \\
+        --clock-min 1200 --clock-max 1900 --clock-step 50 --warmup-seconds 10 \\
+        --bench-iterations 100 \\
         -- \\
         --mnkl=4096,13568,16384,1 --use_cold_l2 --init_normal --normal_mean=0.0 \\
         --normal_std=0.1 --a_dtype=BFloat16 --b_dtype=BFloat16 --c_dtype=BFloat16 \\
@@ -36,7 +37,7 @@ sys.path.insert(0, _this_dir)
 sys.path.insert(0, os.path.dirname(_this_dir))  # kernel/, so "dense_gemm.foo" imports resolve
 
 from gpu_clock import lock_sm_clock, reset_sm_clock
-from nvml_sampler import NvmlSampler
+from nvml_sampler import NvmlSampler, compute_stats, trim_by_time_fraction
 
 from cutlass import testing
 
@@ -58,11 +59,20 @@ def build_sweep_parser() -> argparse.ArgumentParser:
     parser.add_argument("--clock-step", type=int, default=100, help="SM clock step (MHz)")
     parser.add_argument("--gpu-index", type=int, default=0, help="GPU index for nvidia-smi / NVML")
     parser.add_argument(
-        "--target-seconds",
+        "--warmup-seconds",
         type=float,
-        default=15.0,
-        help="Minimum wall-clock duration of the timed benchmark region at the "
-        "slowest (--clock-min) clock; the iteration count is calibrated to hit this.",
+        default=10.0,
+        help="Target wall-clock duration of the warmup phase at each locked clock, used "
+        "to let the clock ramp up and settle before the timed benchmark iterations run. "
+        "The warmup iteration count is calibrated (at the unlocked/default clock) to hit "
+        "this, so it's clock-independent by construction.",
+    )
+    parser.add_argument(
+        "--bench-iterations",
+        type=int,
+        default=100,
+        help="Fixed number of timed benchmark iterations to run at every clock "
+        "(unlike warmup, this is not time-based).",
     )
     parser.add_argument(
         "--calib-iterations",
@@ -77,12 +87,6 @@ def build_sweep_parser() -> argparse.ArgumentParser:
         help="Warmup iterations used for the one-time calibration run.",
     )
     parser.add_argument(
-        "--warmup-iterations",
-        type=int,
-        default=100,
-        help="Warmup iterations for each per-clock benchmark run.",
-    )
-    parser.add_argument(
         "--settle-seconds",
         type=float,
         default=1.0,
@@ -91,8 +95,11 @@ def build_sweep_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--sample-interval-ms",
         type=float,
-        default=20.0,
-        help="NVML sampling interval in milliseconds.",
+        default=5.0,
+        help="NVML sampling interval in milliseconds. Since only the fixed "
+        "--bench-iterations tail of each run is kept (see keep_fraction), this "
+        "should be small relative to that tail's expected duration, or few "
+        "samples will survive trimming.",
     )
     parser.add_argument(
         "--csv-out",
@@ -155,8 +162,8 @@ def _invoke_dense_gemm(kernel_module, kernel_args, sweep_args, sweep_callback):
         kernel_args.use_2cta_instrs,
         kernel_args.use_tma_store,
         kernel_args.tolerance,
-        sweep_args.warmup_iterations,
-        sweep_args.calib_iterations,
+        0,  # warmup_iterations: unused, benchmark_sweep short-circuits before this matters
+        1,  # iterations: unused, ditto
         kernel_args.skip_ref_check,
         kernel_args.use_cold_l2,
         kernel_args.benchmark == "default",
@@ -185,8 +192,8 @@ def _invoke_blockscaled_gemm(kernel_module, kernel_args, sweep_args, sweep_callb
         kernel_args.raster_order,
         kernel_args.scheduler,
         kernel_args.tolerance,
-        sweep_args.warmup_iterations,
-        sweep_args.calib_iterations,
+        0,  # warmup_iterations: unused, benchmark_sweep short-circuits before this matters
+        1,  # iterations: unused, ditto
         kernel_args.skip_ref_check,
         kernel_args.use_cold_l2,
         kernel_args.init_normal,
@@ -221,10 +228,7 @@ def main():
             f"Known modules: {sorted(KERNEL_ADAPTERS)}. Add an adapter to "
             f"KERNEL_ADAPTERS in {__file__}."
         )
-    prepare_parser_fn = getattr(kernel_module, "prepare_parser", None) or getattr(
-        kernel_module, "prepare_parser"
-    )
-    kernel_parser = prepare_parser_fn()
+    kernel_parser = kernel_module.prepare_parser()
     kernel_args = kernel_parser.parse_args(kernel_argv)
 
     if len(kernel_args.mnkl) != 4:
@@ -240,11 +244,11 @@ def main():
 
     def sweep_callback(ctx):
         # One-time calibration at the *unlocked* (default/boost) clock, i.e. the
-        # fastest the kernel will ever run. Sizing the iteration count off the
-        # slowest requested clock would undershoot --target-seconds at every
-        # faster clock (fewer iterations x less time-per-iteration = short runs);
-        # sizing off the fastest case guarantees every locked clock in the sweep,
-        # being <= the unlocked clock, runs for at least --target-seconds.
+        # fastest the kernel will ever run, to size the warmup iteration count so
+        # the warmup phase takes ~--warmup-seconds at whatever clock ends up locked.
+        # Warmup and the fixed --bench-iterations run back-to-back inside the same
+        # locked clock, so (assuming roughly constant per-iteration time once the
+        # clock has settled) this ratio is clock-independent.
         print(
             f"[sweep] Calibrating at unlocked/default clock "
             f"({sweep_args.calib_warmup} warmup + {sweep_args.calib_iterations} iterations)..."
@@ -254,13 +258,26 @@ def main():
         calib_exec_time_us = run_benchmark(
             ctx, sweep_args.calib_iterations, sweep_args.calib_warmup
         )
-        iterations = max(
+        iterations = sweep_args.bench_iterations
+        warmup_iterations = max(
             sweep_args.calib_iterations,
-            int(-(-sweep_args.target_seconds * 1e6 // calib_exec_time_us)),  # ceil div
+            int(-(-sweep_args.warmup_seconds * 1e6 // calib_exec_time_us)),  # ceil div
         )
+        # cutlass.testing.benchmark doesn't tell us when it switches from warmup to
+        # timed iterations, so we can't precisely mark that boundary in the NVML
+        # sample stream. Instead we approximate it: since warmup and the timed
+        # iterations run at the same locked clock (so ~equal per-iteration time),
+        # the timed iterations make up this fraction of the *whole* call's wall
+        # time. We keep only that trailing fraction of NVML samples, which drops
+        # the entire warmup phase -- including any clock ramp-up right after
+        # locking -- and reports clock/power for (approximately) just the timed
+        # region.
+        keep_fraction = iterations / (warmup_iterations + iterations)
         print(
-            f"[sweep] Calibration: {calib_exec_time_us:.2f} us/iter (unlocked) -> using "
-            f"{iterations} iterations per clock ({sweep_args.warmup_iterations} warmup)."
+            f"[sweep] Calibration: {calib_exec_time_us:.2f} us/iter (unlocked) -> "
+            f"{warmup_iterations} warmup iterations (target {sweep_args.warmup_seconds}s) + "
+            f"{iterations} fixed benchmark iterations per clock "
+            f"(keeping last {keep_fraction * 100:.0f}% of NVML samples per clock)."
         )
 
         for clock_mhz in clocks:
@@ -269,10 +286,17 @@ def main():
             time.sleep(sweep_args.settle_seconds)
 
             sampler.start()
-            exec_time_us = run_benchmark(
-                ctx, iterations, sweep_args.warmup_iterations
+            exec_time_us = run_benchmark(ctx, iterations, warmup_iterations)
+            raw_stats = sampler.stop()
+            stats = compute_stats(
+                trim_by_time_fraction(raw_stats.samples, keep_fraction)
             )
-            stats = sampler.stop()
+            if stats.num_samples < 5:
+                print(
+                    f"[sweep] WARNING: only {stats.num_samples} NVML sample(s) survived "
+                    f"trimming at {clock_mhz} MHz; achieved clock/power for this row is "
+                    f"unreliable. Lower --sample-interval-ms or raise --bench-iterations."
+                )
 
             tflops = total_flops / exec_time_us / 1e6
             row = {
@@ -285,9 +309,12 @@ def main():
                 "mean_temperature_c": round(stats.mean_temperature_c, 1),
                 "exec_time_us_per_iter": round(exec_time_us, 2),
                 "tflops": round(tflops, 1),
+                "warmup_iterations": warmup_iterations,
                 "iterations": iterations,
-                "num_nvml_samples": stats.num_samples,
-                "sampled_duration_s": round(stats.duration_s, 2),
+                "num_nvml_samples_kept": stats.num_samples,
+                "num_nvml_samples_total": raw_stats.num_samples,
+                "kept_duration_s": round(stats.duration_s, 2),
+                "total_duration_s": round(raw_stats.duration_s, 2),
             }
             results.append(row)
             print(
@@ -295,7 +322,8 @@ def main():
                 f"achieved={row['achieved_mean_sm_clock_mhz']} MHz  "
                 f"power={row['mean_power_w']} W  "
                 f"{row['tflops']} TFLOP/s  "
-                f"({row['num_nvml_samples']} samples over {row['sampled_duration_s']}s)"
+                f"({row['num_nvml_samples_kept']}/{row['num_nvml_samples_total']} samples kept, "
+                f"{row['kept_duration_s']}/{row['total_duration_s']}s)"
             )
 
         return results
