@@ -37,7 +37,7 @@ sys.path.insert(0, _this_dir)
 sys.path.insert(0, os.path.dirname(_this_dir))  # kernel/, so "dense_gemm.foo" imports resolve
 
 from gpu_clock import lock_sm_clock, reset_sm_clock
-from nvml_sampler import NvmlSampler, compute_stats, trim_by_time_fraction
+from nvml_sampler import NvmlSampler, compute_stats, trim_to_middle_fraction
 
 from cutlass import testing
 
@@ -96,10 +96,19 @@ def build_sweep_parser() -> argparse.ArgumentParser:
         "--sample-interval-ms",
         type=float,
         default=5.0,
-        help="NVML sampling interval in milliseconds. Since only the fixed "
-        "--bench-iterations tail of each run is kept (see keep_fraction), this "
-        "should be small relative to that tail's expected duration, or few "
-        "samples will survive trimming.",
+        help="NVML sampling interval in milliseconds.",
+    )
+    parser.add_argument(
+        "--keep-middle-fraction",
+        type=float,
+        default=1.0 / 3.0,
+        help="Of all NVML samples collected across the whole warmup+benchmark call at "
+        "a locked clock, keep only this middle fraction (by elapsed time) when "
+        "computing achieved clock/power. Drops the early samples (clock still "
+        "ramping up after being locked / early warmup) and the late samples (clock "
+        "starting to recover once the kernel stops issuing sustained load, or idle "
+        "gaps before sampling stops), which otherwise bias the reported clock away "
+        "from what the kernel actually ran at.",
     )
     parser.add_argument(
         "--csv-out",
@@ -265,19 +274,17 @@ def main():
         )
         # cutlass.testing.benchmark doesn't tell us when it switches from warmup to
         # timed iterations, so we can't precisely mark that boundary in the NVML
-        # sample stream. Instead we approximate it: since warmup and the timed
-        # iterations run at the same locked clock (so ~equal per-iteration time),
-        # the timed iterations make up this fraction of the *whole* call's wall
-        # time. We keep only that trailing fraction of NVML samples, which drops
-        # the entire warmup phase -- including any clock ramp-up right after
-        # locking -- and reports clock/power for (approximately) just the timed
-        # region.
-        keep_fraction = iterations / (warmup_iterations + iterations)
+        # sample stream, and the very start/end of the whole call are unreliable
+        # anyway (clock still ramping up right after being locked; clock starting
+        # to recover once the kernel stops issuing sustained load). Instead of
+        # guessing the warmup/benchmark boundary, we just keep the middle
+        # --keep-middle-fraction of samples from the whole call, which should sit
+        # solidly inside the steady-state region regardless of that boundary.
         print(
             f"[sweep] Calibration: {calib_exec_time_us:.2f} us/iter (unlocked) -> "
             f"{warmup_iterations} warmup iterations (target {sweep_args.warmup_seconds}s) + "
             f"{iterations} fixed benchmark iterations per clock "
-            f"(keeping last {keep_fraction * 100:.0f}% of NVML samples per clock)."
+            f"(keeping middle {sweep_args.keep_middle_fraction * 100:.0f}% of NVML samples per clock)."
         )
 
         for clock_mhz in clocks:
@@ -289,7 +296,7 @@ def main():
             exec_time_us = run_benchmark(ctx, iterations, warmup_iterations)
             raw_stats = sampler.stop()
             stats = compute_stats(
-                trim_by_time_fraction(raw_stats.samples, keep_fraction)
+                trim_to_middle_fraction(raw_stats.samples, sweep_args.keep_middle_fraction)
             )
             if stats.num_samples < 5:
                 print(

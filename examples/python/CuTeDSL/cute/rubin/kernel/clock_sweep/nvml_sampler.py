@@ -60,22 +60,26 @@ def compute_stats(samples: List[SweepSample]) -> SweepStats:
     )
 
 
-def trim_by_time_fraction(
+def trim_to_middle_fraction(
     samples: List[SweepSample], keep_fraction: float
 ) -> List[SweepSample]:
-    """Discard the earliest ``1 - keep_fraction`` of ``samples`` by elapsed time.
+    """Keep only the middle ``keep_fraction`` of ``samples`` by elapsed time.
 
-    Useful for dropping a leading region (e.g. clock ramp-up right after locking a
-    new clock, or a long warmup phase) that shouldn't count towards steady-state
-    clock/power stats. Always keeps at least the last sample.
+    Drops both ends of the sample stream: the start (e.g. clock ramp-up right
+    after locking a new clock, or still mid-warmup) and the end (e.g. the clock
+    starting to recover back up once the kernel stops issuing sustained load,
+    or brief idle gaps between the last iteration and when sampling is stopped).
+    Always keeps at least one sample (the one closest to the midpoint).
     """
     if not samples or keep_fraction >= 1.0:
         return samples
     keep_fraction = max(keep_fraction, 0.0)
     t0, t1 = samples[0].t, samples[-1].t
-    cutoff = t1 - keep_fraction * (t1 - t0)
-    trimmed = [s for s in samples if s.t >= cutoff]
-    return trimmed or samples[-1:]
+    mid = (t0 + t1) / 2.0
+    half_width = keep_fraction * (t1 - t0) / 2.0
+    lo, hi = mid - half_width, mid + half_width
+    trimmed = [s for s in samples if lo <= s.t <= hi]
+    return trimmed or [min(samples, key=lambda s: abs(s.t - mid))]
 
 
 class NvmlSampler:
